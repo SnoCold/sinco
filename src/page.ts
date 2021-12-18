@@ -15,6 +15,12 @@ export class Page {
     this.#protocol = protocol;
   }
 
+
+  async #connectToPage(){
+    await this.#protocol.sendWebSocketMessage("Target.activateTarget", {targetId: this.#protocol.frame_id})
+  }
+
+ 
   /**
    * Either get all cookies for the page, or set a cookie
    *
@@ -56,13 +62,19 @@ export class Page {
    * @returns The location for the page if no parameter is passed in, else an empty string
    */
   public async location(newLocation?: string): Promise<string> {
+    const backupFrameID = this.#protocol.frame_id // This value is getting altered. no Freaking Idea why or how. so I save it
+    console.log("Backup ID iss  "+backupFrameID)
     if (!newLocation) {
       const targets = await this.#protocol.sendWebSocketMessage<
         null,
         Protocol.Target.GetTargetsResponse
       >("Target.getTargets");
-      return targets.targetInfos[0].url;
+      this.#protocol.frame_id = backupFrameID //we just need it here, but have to reassign to compensate for auto change
+      
+      return targets.targetInfos.find((info) => info.targetId === this.#protocol.frame_id)!!.url
+      
     }
+    await this.#connectToPage()
     const method = "Page.loadEventFired";
     this.#protocol.notification_resolvables.set(method, deferred());
     const notificationPromise = this.#protocol.notification_resolvables.get(
@@ -83,7 +95,44 @@ export class Page {
         `${res.errorText}: Error for navigating to page "${newLocation}"`,
       );
     }
+    this.#protocol.frame_id = backupFrameID //same here
+    
     return "";
+    
+  }
+
+  public async close() {
+    if (this.#protocol.browser === "chrome") {
+      //Chrome has an endpoint available for closing tabs, so using that
+      const urlToClose = "http://" + this.#protocol.socket.url.match(/\/\/([a-zA-z0-9.]*\:\d*)\//)!![1] + "/json/close/" + this.#protocol.frame_id;
+      let response = await fetch(urlToClose)
+      
+      if (response.status !== 200) {
+        this.#protocol.done("An error occured on closing the required tab");
+      }
+
+    } else {
+
+      // In Firefox, we open the ws to browser process first
+      let promise = deferred();
+      const newProtocol = new ProtocolClass(
+        new WebSocket(this.#protocol.browserWSUrl!!),
+        this.#protocol.browser_process,
+        this.#protocol.browser,
+        this.#protocol.browserWSUrl!!.split("/").pop()!!,
+        this.#protocol.firefox_profile_path
+      )
+      newProtocol.socket.onopen = () => promise.resolve();
+      await promise;
+      // Then close the tab
+      await newProtocol.sendWebSocketMessage("Target.closeTarget",{targetId:this.#protocol.frame_id})
+
+      // And then close ws to be safe
+      promise = deferred();
+      newProtocol.socket.onclose = () => promise.resolve();
+      newProtocol.socket.close()
+      await promise;
+    }
   }
 
   /**
@@ -98,6 +147,8 @@ export class Page {
     // As defined by the #protocol, the `value` is `any`
     // deno-lint-ignore no-explicit-any
   ): Promise<any> {
+    await this.#connectToPage()
+    console.error("The FrameID "+ this.#protocol.frame_id + " and ws url "+ this.#protocol.socket.url)
     if (typeof pageCommand === "string") {
       const result = await this.#protocol.sendWebSocketMessage<
         Protocol.Runtime.EvaluateRequest,
@@ -107,6 +158,7 @@ export class Page {
         includeCommandLineAPI: true, // supports things like $x
       });
       await this.#checkForErrorResult(result, pageCommand);
+      console.log(result)
       return result.result.value;
     }
 
@@ -120,7 +172,7 @@ export class Page {
           frameId: this.#protocol.frame_id,
         },
       );
-
+      console.log("execcontextID " + executionContextId)
       const res = await this.#protocol.sendWebSocketMessage<
         Protocol.Runtime.CallFunctionOnRequest,
         Protocol.Runtime.CallFunctionOnResponse
@@ -135,6 +187,7 @@ export class Page {
         },
       );
       await this.#checkForErrorResult(res, pageCommand.toString());
+      console.log(res)
       return res.result.value;
     }
   }
@@ -143,6 +196,8 @@ export class Page {
    * Wait for the page to change. Can be used with `click()` if clicking a button or anchor tag that redirects the user
    */
   async waitForPageChange(): Promise<void> {
+    await this.#connectToPage()
+    const backupFrameID = this.#protocol.frame_id
     const method = "Page.loadEventFired";
     this.#protocol.notification_resolvables.set(method, deferred());
     const notificationPromise = this.#protocol.notification_resolvables.get(
@@ -150,6 +205,7 @@ export class Page {
     );
     await notificationPromise;
     this.#protocol.notification_resolvables.delete(method);
+    this.#protocol.frame_id = backupFrameID 
   }
 
   /**
@@ -158,6 +214,7 @@ export class Page {
    * @param text - The text to check for
    */
   async assertSee(text: string): Promise<void> {
+    await this.#connectToPage()
     const command = `document.body.innerText.includes('${text}')`;
     const exists = await this.evaluate(command);
     if (exists !== true) { // We know it's going to fail, so before an assertion error is thrown, cleanupup
@@ -174,6 +231,7 @@ export class Page {
    * @returns An element class, allowing you to take an action upon that element
    */
   async querySelector(selector: string) {
+    await this.#connectToPage()
     const result = await this.evaluate(
       `document.querySelector('${selector}')`,
     );
@@ -199,6 +257,7 @@ export class Page {
     path: string,
     options?: ScreenshotOptions,
   ): Promise<string> {
+    await this.#connectToPage()
     if (!existsSync(path)) {
       await this.#protocol.done();
       throw new Error(`The provided folder path - ${path} doesn't exist`);

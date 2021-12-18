@@ -25,6 +25,11 @@ export class Protocol {
   public browser_process: Deno.Process;
 
   /**
+   * If we are running firefox , then we can connect to the browser ws seperately to perform tasks
+   */
+  public browserWSUrl: string|undefined = undefined;
+
+  /**
    * What browser we running?
    */
   public browser: Browsers;
@@ -167,21 +172,23 @@ export class Protocol {
    *
    * @param hostname - The hostname to fetch from
    * @param port -  The port for the hostname to fetch from
-   *
+   * @param targetId - The targetId to fetch for - optional
+   * 
    * @returns The url to connect to
    */
   public static async getWebSocketInfo(
     hostname: string,
     port: number,
+    targetId?:string //To get specific page ws info
   ): Promise<{ debugUrl: string; frameId: string }> {
     let debugUrl = "";
     let frameId = "";
     while (debugUrl === "") {
       try {
         const res = await fetch(`http://${hostname}:${port}/json/list`);
-        const json = await res.json();
-        debugUrl = json[0]["webSocketDebuggerUrl"];
-        frameId = json[0]["id"];
+        const json:Array<any> = await res.json();
+        debugUrl = (targetId)?json.filter((obj) => obj["id"] === targetId)[0]["webSocketDebuggerUrl"] :json[0]["webSocketDebuggerUrl"];
+        frameId = targetId ?? json[0]["id"];
       } catch (_err) {
         // do nothing, loop again until the endpoint is ready
       }

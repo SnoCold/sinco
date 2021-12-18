@@ -38,10 +38,18 @@ import type { Browsers } from "./types.ts";
  */
 export class Client {
   #protocol: ProtocolClass;
+  #tabCount: number;
+  #hostname: string;
+  #port: number;
   constructor(
     protocol: ProtocolClass,
+    hostname: string,
+    port: number,
   ) {
     this.#protocol = protocol;
+    this.#tabCount = 0; //As a browser is created, the default tabcount is 1 but creating with 0 here to use a handling logic in goto
+    this.#hostname = hostname 
+    this.#port = port
   }
 
   /**
@@ -59,27 +67,64 @@ export class Client {
    * @returns A page instance, with methods to help you directly interact with the page
    */
   public async goTo(urlToVisit: string): Promise<Page> {
-    const method = "Page.loadEventFired";
-    this.#protocol.notification_resolvables.set(method, deferred());
-    const notificationPromise = this.#protocol.notification_resolvables.get(
-      method,
-    );
-    const res = await this.#protocol.sendWebSocketMessage<
-      ProtocolTypes.Page.NavigateRequest,
-      ProtocolTypes.Page.NavigateResponse
-    >(
-      "Page.navigate",
-      {
-        url: urlToVisit,
-      },
-    );
-    await notificationPromise;
-    if (res.errorText) {
-      await this.#protocol.done(
-        `${res.errorText}: Error for navigating to page "${urlToVisit}"`,
+    
+    if(this.#tabCount++ === 0){
+      if (this.#protocol.browser === "firefox") {
+        const res = await fetch(`http://${this.#hostname}:${this.#port}/json/list`);
+        const json: Array<any> = await res.json();
+        this.#protocol.browserWSUrl = json.find((obj) => obj["type"] === "browser")!!["webSocketDebuggerUrl"]
+      }
+
+      const backupFrameID = this.#protocol.frame_id
+      const method = "Page.loadEventFired";
+      this.#protocol.notification_resolvables.set(method, deferred());
+      const notificationPromise = this.#protocol.notification_resolvables.get(
+        method,
       );
+      const res = await this.#protocol.sendWebSocketMessage<
+        ProtocolTypes.Page.NavigateRequest,
+        ProtocolTypes.Page.NavigateResponse
+      >(
+        "Page.navigate",
+        {
+          url: urlToVisit,
+        },
+      );
+      await notificationPromise;
+      if (res.errorText) {
+        await this.#protocol.done(
+          `${res.errorText}: Error for navigating to page "${urlToVisit}"`,
+        );
+      }
+      this.#protocol.frame_id = backupFrameID
+      
+      return new Page(this.#protocol)
+    } else {
+
+      const newTarget = await this.#protocol.sendWebSocketMessage<ProtocolTypes.Target.CreateTargetRequest,ProtocolTypes.Target.CreateTargetResponse>("Target.createTarget", {url: urlToVisit})
+      
+      const newProtocol = new ProtocolClass(
+        new WebSocket(
+          (await ProtocolClass.getWebSocketInfo(this.#hostname,this.#port,newTarget.targetId)).debugUrl
+        ),
+        this.#protocol.browser_process,
+        this.#protocol.browser,
+        newTarget.targetId,
+        this.#protocol.firefox_profile_path
+      )
+      newProtocol.browserWSUrl = this.#protocol.browserWSUrl
+          
+      const promise = deferred();
+      newProtocol.socket.onopen = () => promise.resolve();
+      await promise;
+     
+      await newProtocol.sendWebSocketMessage("Page.enable");
+      await newProtocol.sendWebSocketMessage("Runtime.enable");
+      const page = new Page(newProtocol)
+      if(this.#protocol.browser === "firefox")
+        await page.location(urlToVisit)
+      return page 
     }
-    return new Page(this.#protocol);
   }
 
   /**
@@ -142,6 +187,9 @@ export class Client {
     );
     await protocol.sendWebSocketMessage("Page.enable");
     await protocol.sendWebSocketMessage("Runtime.enable");
-    return new Client(protocol);
+    // protocol.socket.onerror = (err) => console.error(err)
+    return new Client(protocol, 
+      wsOptions.hostname,
+      wsOptions.port,);
   }
 }
